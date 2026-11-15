@@ -1,0 +1,20 @@
+# AWS CloudFormation template applied on container startup.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Local acceptance-test DynamoDB table and Kinesis stream
+Resources:
+  Entities:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: entities
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+  Events:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: events
+      ShardCount: 1

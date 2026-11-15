@@ -1,0 +1,142 @@
+# Project name; prefixes generated container, network, and volume names.
+name: acceptance-demo
+# Reusable environment map: x- is a Compose extension; &aws defines a YAML anchor.
+x-aws: &aws
+  # Internal DNS endpoint; the gateway provides a certificate valid for hostname aws-gateway.
+  AWS_ENDPOINT_URL: https://aws-gateway:9443
+  # Per-run emulator credentials, at the path mounted inside client containers.
+  AWS_SHARED_CREDENTIALS_FILE: /emulator/9297/emulator_credentials
+  # Certificate trusted by the AWS CLI when connecting over HTTPS.
+  AWS_CA_BUNDLE: /tls/ca.pem
+  # Default Region used by the AWS CLI.
+  AWS_DEFAULT_REGION: us-east-1
+  # Region used by AWS SDK clients; kept consistent with the CLI.
+  AWS_REGION: us-east-1
+  # Disable EC2 metadata credential discovery.
+  AWS_EC2_METADATA_DISABLED: "true"
+  # Disable optional Java SDK CBOR encoding for Kinesis emulator compatibility.
+  CBOR_ENABLED: "false"
+  # JVM options: trust the gateway certificate; changeit is a development trust-store password.
+  JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/tls/truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStoreType=PKCS12
+# Container service definitions.
+services:
+  # Only the AWS API process runs here; its state is in memory.
+  aws-emulator:
+    image: acceptance/aws-emulator:local
+    build: infrastructure/aws-emulator
+    ports: ["127.0.0.1:9297:9297"]
+    volumes:
+      - emulator-files:/home/emulator/.aws/emulator
+    healthcheck:
+      test: [CMD-SHELL, "curl -fsS --cacert /home/emulator/.aws/emulator/9297/ca.pem https://localhost:9297/__admin/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 90
+      start_period: 30s
+  # HTTPS forwarding and certificate preparation are independent of emulator lifetime.
+  aws-gateway:
+    image: acceptance/aws-gateway:local
+    build: infrastructure/aws-gateway
+    ports: ["127.0.0.1:9443:9443"]
+    restart: unless-stopped
+    volumes:
+      - emulator-files:/emulator:ro
+      - gateway-tls:/tls
+      - gateway-private:/private-tls
+    depends_on:
+      aws-emulator: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, "curl -fsS --cacert /tls/ca.pem https://localhost:9443/__admin/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  # One-shot provisioning; a failure blocks application startup.
+  aws-init:
+    image: acceptance/aws-init:local
+    build: infrastructure/aws-init
+    environment:
+      <<: *aws
+    volumes:
+      - emulator-files:/emulator:ro
+      - gateway-tls:/tls:ro
+      - ./infrastructure/aws-init/resources.yaml:/bootstrap/resources.yaml:ro
+    depends_on:
+      aws-gateway: {condition: service_healthy}
+  # Mock third-party HTTP service.
+  wiremock:
+    # Pinned WireMock image version.
+    image: wiremock/wiremock:3.13.1
+    # Publish WireMock for manual request inspection; internal clients use wiremock:8080.
+    ports: ["127.0.0.1:8080:8080"]
+    # Filesystem mounts for WireMock.
+    volumes:
+      # Read-only configuration directory; mappings/ contains the startup stubs.
+      - ./infrastructure/wiremock:/home/wiremock:ro
+    # WireMock runs independently of AWS infrastructure.
+  # Shared HTTP entrypoint; strips service prefixes before forwarding to each application.
+  api-gateway:
+    image: nginx:1.28-alpine
+    ports: ["127.0.0.1:18080:8080"]
+    volumes:
+      - ./infrastructure/api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      service-one: {condition: service_started}
+      service-two: {condition: service_started}
+  # First Spring Boot service: HTTP -> DynamoDB -> Kinesis.
+  service-one:
+    # Image name and tag assigned to the service build.
+    image: acceptance/service-one:local
+    # Build using service-one/Dockerfile and that directory as context.
+    build: service-one
+    # Public entrypoint for manual HTTP requests.
+    ports: ["127.0.0.1:18081:18081"]
+    # Environment variables supplied to this service.
+    environment:
+      # Merge the reusable AWS environment settings into this map.
+      <<: *aws
+      # DynamoDB table used to store entities.
+      ENTITY_TABLE: entities
+      # Kinesis stream used to publish entity events.
+      EVENT_STREAM: events
+      # HTTP port read by our Spring Boot application configuration.
+      SERVICE_PORT: "18081"
+    # Read-only mount of the generated credentials and trust files; compact YAML list syntax.
+    volumes: ["emulator-files:/emulator:ro", "gateway-tls:/tls:ro"]
+    # Startup dependencies for service one.
+    depends_on:
+      # Wait for initialization; restart the app when Compose updates initialization.
+      aws-init: {condition: service_completed_successfully, restart: true}
+  # Second Spring Boot service: Kinesis -> third-party HTTP.
+  service-two:
+    # Image name and tag assigned to the service build.
+    image: acceptance/service-two:local
+    # Build using service-two/Dockerfile and that directory as context.
+    build: service-two
+    # Host tests poll readiness directly.
+    ports: ["127.0.0.1:18082:18082"]
+    # Environment variables supplied to this service.
+    environment:
+      # Merge the reusable AWS environment settings.
+      <<: *aws
+      # Kinesis stream consumed by this service.
+      EVENT_STREAM: events
+      # HTTP/readiness port, also published on host loopback.
+      SERVICE_PORT: "18082"
+      # Reach WireMock using Compose service DNS.
+      THIRD_PARTY_BASE_URL: http://wiremock:8080
+    # Read-only access to the generated credentials and trust files.
+    volumes: ["emulator-files:/emulator:ro", "gateway-tls:/tls:ro"]
+    # Startup dependencies for service two.
+    depends_on:
+      # Wait for initialization; reload credentials when Compose updates initialization.
+      aws-init: {condition: service_completed_successfully, restart: true}
+      # Wait for WireMock's container to start; this does not check HTTP readiness.
+      wiremock: {condition: service_started}
+# Project-level named volume declarations, separate from each service's mounts.
+volumes:
+  # Shared credentials/certificates volume; does not persist in-memory DynamoDB or Kinesis data.
+  emulator-files:
+  # Public gateway certificates only; never contains its private key.
+  gateway-tls:
+  # Private gateway key, mounted only by the gateway to preserve trust on restart.
+  gateway-private:
